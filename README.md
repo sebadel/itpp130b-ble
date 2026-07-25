@@ -13,9 +13,9 @@ sudo ./setup.sh
 The MUNBYN ITPP130B only supports BLE (not classic Bluetooth SPP) on Linux. The manufacturer's Windows-only BLE driver doesn't work on Linux. This driver:
 
 1. Installs a custom CUPS backend that communicates via BLE GATT
-2. Pairs the printer via Bluetooth
-3. Converts PDF text content to TSPL TEXT commands (via pdftotext)
-4. Wraps plain text in TSPL commands for direct printing
+2. Installs a CUPS filter that converts PDF/PostScript/text to TSPL
+3. Pairs the printer via Bluetooth
+4. Enables printing from any application (file viewers, command line, etc.)
 
 ## Requirements
 
@@ -30,7 +30,8 @@ The MUNBYN ITPP130B only supports BLE (not classic Bluetooth SPP) on Linux. The 
 
 - `setup.sh` - Automated installer
 - `backend/ble` - CUPS backend (Python 3 + bleak)
-- `ppd/Printer_ITPP130.ppd` - PPD for raw printing mode
+- `filter/ble_tspl` - CUPS filter (converts PDF/PS/text to TSPL)
+- `ppd/Printer_ITPP130.ppd` - PPD with cupsFilter entries
 - `README.md` - Documentation
 
 ## Known Issues
@@ -41,20 +42,41 @@ The MUNBYN ITPP130B only supports BLE (not classic Bluetooth SPP) on Linux. The 
 
 ## How It Works
 
-The CUPS backend (`/usr/lib/cups/backend/ble`) uses Python bleak to:
-1. Disconnect any existing bluetoothctl connection to the printer
-2. Connect directly via BLE GATT
-3. Find a writable characteristic (prefers FFF2 or ISSC UART)
-4. Send TSPL data in MTU-sized chunks (no delay between chunks for speed)
+### CUPS Filter (`/usr/lib/cups/filter/ble_tspl`)
 
-Data flow:
+The filter handles format conversion:
+- Detects input type (PDF, PostScript, or plain text)
+- Extracts text using pdftotext (PDF) or ghostscript (PostScript)
+- Converts text to TSPL TEXT commands
+- Outputs TSPL for the backend
+
+### CUPS Backend (`/usr/lib/cups/backend/ble`)
+
+The backend handles BLE communication:
+1. Disconnects any existing bluetoothctl connection
+2. Connects directly via BLE GATT
+3. Finds a writable characteristic (prefers FFF2 or ISSC UART)
+4. Sends TSPL data in MTU-sized chunks
+
+### Data Flow
+
 ```
-PDF input      -> pdftotext -> TSPL TEXT commands -> BLE backend -> printer
-PostScript     -> ghostscript txtwrite -> TSPL TEXT commands -> BLE backend -> printer
-Text input     -> TSPL TEXT commands             -> BLE backend -> printer
+Application (Evince, lp, etc.)
+    |
+    v
+CUPS Filter (ble_tspl)
+    |-- PDF: pdftotext -> TSPL TEXT commands
+    |-- PostScript: ghostscript -> TSPL TEXT commands
+    |-- Text: wrap in TSPL TEXT commands
+    |
+    v
+CUPS Backend (ble)
+    |
+    v
+Printer (BLE GATT)
 ```
 
-The backend detects input type (PDF vs text vs TSPL) and converts accordingly.
+This architecture allows file viewers to print correctly since they send `application/pdf` which CUPS routes through the filter.
 
 ## License
 
