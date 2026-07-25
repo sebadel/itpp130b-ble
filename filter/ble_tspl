@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""CUPS filter: converts PDF/PostScript/text to TSPL for BLE thermal printers."""
+"""CUPS filter: renders PDF/PostScript to bitmap TSPL for BLE thermal printers."""
 
 import sys
 import os
 import subprocess
 import tempfile
+import math
 import logging
 
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(levelname)s %(message)s')
@@ -12,56 +13,103 @@ log = logging.getLogger('ble-tspl-filter')
 
 LABEL_WIDTH_MM = 100
 LABEL_HEIGHT_MM = 150
-FONT_SIZE_SMALL = 1
-FONT_SIZE_LARGE = 2
-LINE_SPACING = 28
-MARGIN_X = 10
-START_Y = 10
+DPI = 203
+GAP_MM = 3
+DENSITY = 8
+SPEED = 4
+
+LABEL_WIDTH_PX = int(round(LABEL_WIDTH_MM / 25.4 * DPI))
+LABEL_HEIGHT_PX = int(round(LABEL_HEIGHT_MM / 25.4 * DPI))
 
 
-def extract_text_from_pdf(data):
-    """Extract text from PDF using pdftotext."""
-    with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as f:
-        f.write(data)
-        pdf_path = f.name
+def render_pdf_to_bitmap(pdf_path):
+    """Render PDF to monochrome PBM using pdftoppm at printer DPI."""
+    with tempfile.NamedTemporaryFile(suffix='.pbm', delete=False) as f:
+        prefix = f.name[:-4]
+
     try:
-        result = subprocess.run(
-            ['pdftotext', '-layout', pdf_path, '-'],
-            capture_output=True, timeout=30
-        )
-        text = result.stdout.decode('utf-8', errors='replace')
-        log.info(f"pdftotext extracted {len(text)} chars from PDF")
-        return text
+        subprocess.run([
+            'pdftoppm', '-mono', '-singlefile',
+            '-r', str(DPI),
+            '-scale-to-x', str(LABEL_WIDTH_PX),
+            '-scale-to-y', str(LABEL_HEIGHT_PX),
+            pdf_path, prefix
+        ], check=True, timeout=30)
+
+        pbm_path = prefix + '.pbm'
+        with open(pbm_path, 'rb') as f:
+            header = f.readline()  # P4
+            dims = f.readline()    # WIDTH HEIGHT
+            data = f.read()
+
+        width, height = map(int, dims.strip().split())
+        log.info(f"pdftoppm rendered {width}x{height} PBM ({len(data)} bytes)")
+
+        # PBM P4: 1=black, 0=white
+        # Many printers use 1=black (intuitive), no inversion needed
+        return width, height, data
     except Exception as e:
-        log.error(f"pdftotext failed: {e}")
-        return None
+        log.error(f"pdftoppm failed: {e}")
+        return None, None, None
     finally:
-        os.unlink(pdf_path)
+        for ext in ['.pbm']:
+            try:
+                os.unlink(prefix + ext)
+            except OSError:
+                pass
 
 
-def extract_text_from_postscript(data):
-    """Extract text from PostScript using ghostscript."""
+def ps_to_pdf(ps_data):
+    """Convert PostScript to PDF using ghostscript."""
     with tempfile.NamedTemporaryFile(suffix='.ps', delete=False) as f:
-        f.write(data)
+        f.write(ps_data)
         ps_path = f.name
+    pdf_path = ps_path.replace('.ps', '.pdf')
     try:
-        result = subprocess.run(
-            ['gs', '-q', '-dNOPAUSE', '-dBATCH', '-sDEVICE=txtwrite',
-             '-sOutputFile=-', ps_path],
-            capture_output=True, timeout=30
-        )
-        text = result.stdout.decode('utf-8', errors='replace')
-        log.info(f"ghostscript extracted {len(text)} chars from PostScript")
-        return text
+        subprocess.run([
+            'gs', '-q', '-dNOPAUSE', '-dBATCH', '-sDEVICE=pdfwrite',
+            f'-sOutputFile={pdf_path}', ps_path
+        ], check=True, timeout=30)
+        log.info(f"Converted PS to PDF: {os.path.getsize(pdf_path)} bytes")
+        return pdf_path
     except Exception as e:
-        log.error(f"ghostscript text extraction failed: {e}")
+        log.error(f"PS to PDF conversion failed: {e}")
         return None
     finally:
-        os.unlink(ps_path)
+        try:
+            os.unlink(ps_path)
+        except OSError:
+            pass
+
+
+def build_bitmap_tspl(width_px, height_px, bitmap_data):
+    """Build TSPL job with BITMAP command for the full label."""
+    row_bytes = math.ceil(width_px / 8)
+
+    # Center image on label
+    x = (LABEL_WIDTH_PX - width_px) // 2
+    y = (LABEL_HEIGHT_PX - height_px) // 2
+
+    tspl = (
+        f"SIZE {LABEL_WIDTH_MM} mm,{LABEL_HEIGHT_MM} mm\r\n"
+        f"GAP {GAP_MM} mm,0 mm\r\n"
+        f"DENSITY {DENSITY}\r\n"
+        f"SPEED {SPEED}\r\n"
+        f"CLS\r\n"
+    )
+
+    bitmap_header = f"BITMAP {x},{y},{row_bytes},{height_px},0,"
+
+    result = tspl.encode('ascii')
+    result += bitmap_header.encode('ascii')
+    result += bitmap_data
+    result += b"\r\nPRINT 1\r\n"
+
+    return result
 
 
 def text_to_tspl(text):
-    """Convert plain text to TSPL TEXT commands."""
+    """Fallback: convert plain text to TSPL TEXT commands."""
     lines = text.strip().split('\n')
 
     tspl = f"SIZE {LABEL_WIDTH_MM},{LABEL_HEIGHT_MM}\n"
@@ -70,7 +118,7 @@ def text_to_tspl(text):
     tspl += "SPEED 4\n"
     tspl += "CLS\n"
 
-    y = START_Y
+    y = 10
     for line in lines:
         if y > LABEL_HEIGHT_MM * 3.7 - 20:
             break
@@ -80,34 +128,30 @@ def text_to_tspl(text):
             while escaped:
                 chunk = escaped[:max_chars]
                 escaped = escaped[max_chars:]
-                tspl += f'TEXT {MARGIN_X},{y},"FONT 0",0,1,1,"{chunk}"\n'
-                y += LINE_SPACING
+                tspl += f'TEXT 10,{y},"FONT 0",0,1,1,"{chunk}"\n'
+                y += 28
         else:
-            y += LINE_SPACING // 2
+            y += 14
 
     tspl += "PRINT 1\n"
     return tspl.encode('latin-1')
 
 
 def is_postscript(data):
-    """Check if data starts with PostScript magic bytes."""
     return data[:2] == b'%!'
 
 
 def is_pdf(data):
-    """Check if data starts with PDF magic bytes."""
     return data[:5] == b'%PDF-'
 
 
 def main():
     log.info(f"Filter called with {len(sys.argv)} args")
 
-    # CUPS filter args: job-id user title copies options [file]
     if len(sys.argv) < 6:
         log.error(f"Not enough args: {len(sys.argv)}")
         sys.exit(1)
 
-    # Read input data
     if len(sys.argv) >= 7 and sys.argv[6] and sys.argv[6] != "-":
         filepath = sys.argv[6]
         log.info(f"Reading from file: {filepath}")
@@ -123,28 +167,72 @@ def main():
         log.warning("No data to print")
         sys.exit(0)
 
-    # Convert to text based on input format
-    text = None
-    if is_pdf(data):
-        log.info(f"Detected PDF data ({len(data)} bytes), extracting text")
-        text = extract_text_from_pdf(data)
-    elif is_postscript(data):
-        log.info(f"Detected PostScript data ({len(data)} bytes), extracting text")
-        text = extract_text_from_postscript(data)
-    else:
-        log.info(f"Treating input as plain text ({len(data)} bytes)")
-        text = data.decode('utf-8', errors='replace')
+    # Try bitmap rendering for PDF/PostScript
+    pdf_path = None
+    try:
+        if is_pdf(data):
+            log.info(f"Detected PDF ({len(data)} bytes), rendering to bitmap")
+            with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as f:
+                f.write(data)
+                pdf_path = f.name
+            width, height, bitmap = render_pdf_to_bitmap(pdf_path)
 
-    if not text or not text.strip():
-        log.error("No text extracted from input")
-        print("ERROR: Could not extract text from input", file=sys.stderr)
-        sys.exit(1)
+        elif is_postscript(data):
+            log.info(f"Detected PostScript ({len(data)} bytes), converting to PDF then bitmap")
+            pdf_path = ps_to_pdf(data)
+            if pdf_path:
+                width, height, bitmap = render_pdf_to_bitmap(pdf_path)
+            else:
+                width, height, bitmap = None, None, None
 
-    # Convert to TSPL and output
-    tspl = text_to_tspl(text)
-    log.info(f"Generated {len(tspl)} bytes of TSPL data")
-    sys.stdout.buffer.write(tspl)
-    sys.stdout.buffer.flush()
+        else:
+            log.info(f"Plain text input ({len(data)} bytes), using TEXT commands")
+            text = data.decode('utf-8', errors='replace')
+            tspl = text_to_tspl(text)
+            log.info(f"Generated {len(tspl)} bytes of TSPL TEXT data")
+            sys.stdout.buffer.write(tspl)
+            sys.stdout.buffer.flush()
+            return
+
+        if bitmap and width and height:
+            log.info(f"Bitmap rendered: {width}x{height}, {len(bitmap)} bytes")
+            tspl = build_bitmap_tspl(width, height, bitmap)
+            log.info(f"Generated {len(tspl)} bytes of TSPL BITMAP data")
+            sys.stdout.buffer.write(tspl)
+            sys.stdout.buffer.flush()
+        else:
+            log.warning("Bitmap rendering failed, falling back to text extraction")
+            if is_pdf(data):
+                result = subprocess.run(
+                    ['pdftotext', '-layout', pdf_path or '/dev/null', '-'],
+                    capture_output=True, timeout=30
+                )
+                text = result.stdout.decode('utf-8', errors='replace')
+            elif is_postscript(data):
+                result = subprocess.run(
+                    ['gs', '-q', '-dNOPAUSE', '-dBATCH', '-sDEVICE=txtwrite',
+                     '-sOutputFile=-', '/dev/stdin'],
+                    input=data, capture_output=True, timeout=30
+                )
+                text = result.stdout.decode('utf-8', errors='replace')
+            else:
+                text = data.decode('utf-8', errors='replace')
+
+            if text and text.strip():
+                tspl = text_to_tspl(text)
+                log.info(f"Fallback: generated {len(tspl)} bytes of TSPL TEXT data")
+                sys.stdout.buffer.write(tspl)
+                sys.stdout.buffer.flush()
+            else:
+                log.error("No printable content found")
+                sys.exit(1)
+
+    finally:
+        if pdf_path:
+            try:
+                os.unlink(pdf_path)
+            except OSError:
+                pass
 
 
 if __name__ == '__main__':

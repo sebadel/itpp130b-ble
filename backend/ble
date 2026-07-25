@@ -6,6 +6,7 @@ import os
 import asyncio
 import subprocess
 import tempfile
+import math
 import logging
 
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(levelname)s %(message)s')
@@ -13,11 +14,13 @@ log = logging.getLogger('ble-backend')
 
 LABEL_WIDTH_MM = 100
 LABEL_HEIGHT_MM = 150
-FONT_SIZE_SMALL = 1
-FONT_SIZE_LARGE = 2
-LINE_SPACING = 28
-MARGIN_X = 10
-START_Y = 10
+DPI = 203
+GAP_MM = 3
+DENSITY = 8
+SPEED = 4
+
+LABEL_WIDTH_PX = int(round(LABEL_WIDTH_MM / 25.4 * DPI))
+LABEL_HEIGHT_PX = int(round(LABEL_HEIGHT_MM / 25.4 * DPI))
 
 BLE_WRITE_CHARS = [
     "0000fff2-0000-1000-8000-00805f9b34fb",
@@ -30,6 +33,90 @@ EXCLUDE_CHARS = [
     "0000fff3-0000-1000-8000-00805f9b34fb",
     "49535343-1e4d-4bd9-ba61-23c647249616",
 ]
+
+
+def render_pdf_to_bitmap(pdf_path):
+    """Render PDF to monochrome PBM using pdftoppm at printer DPI."""
+    with tempfile.NamedTemporaryFile(suffix='.pbm', delete=False) as f:
+        prefix = f.name[:-4]
+
+    try:
+        subprocess.run([
+            'pdftoppm', '-mono', '-singlefile',
+            '-r', str(DPI),
+            '-scale-to-x', str(LABEL_WIDTH_PX),
+            '-scale-to-y', str(LABEL_HEIGHT_PX),
+            pdf_path, prefix
+        ], check=True, timeout=30)
+
+        pbm_path = prefix + '.pbm'
+        with open(pbm_path, 'rb') as f:
+            header = f.readline()  # P4
+            dims = f.readline()    # WIDTH HEIGHT
+            data = f.read()
+
+        width, height = map(int, dims.strip().split())
+        log.info(f"pdftoppm rendered {width}x{height} PBM ({len(data)} bytes)")
+
+        # PBM P4: 1=black, 0=white
+        # Many printers use 1=black (intuitive), no inversion needed
+        return width, height, data
+    except Exception as e:
+        log.error(f"pdftoppm failed: {e}")
+        return None, None, None
+    finally:
+        try:
+            os.unlink(prefix + '.pbm')
+        except OSError:
+            pass
+
+
+def ps_to_pdf(ps_data):
+    """Convert PostScript to PDF using ghostscript."""
+    with tempfile.NamedTemporaryFile(suffix='.ps', delete=False) as f:
+        f.write(ps_data)
+        ps_path = f.name
+    pdf_path = ps_path.replace('.ps', '.pdf')
+    try:
+        subprocess.run([
+            'gs', '-q', '-dNOPAUSE', '-dBATCH', '-sDEVICE=pdfwrite',
+            f'-sOutputFile={pdf_path}', ps_path
+        ], check=True, timeout=30)
+        log.info(f"Converted PS to PDF: {os.path.getsize(pdf_path)} bytes")
+        return pdf_path
+    except Exception as e:
+        log.error(f"PS to PDF conversion failed: {e}")
+        return None
+    finally:
+        try:
+            os.unlink(ps_path)
+        except OSError:
+            pass
+
+
+def build_bitmap_tspl(width_px, height_px, bitmap_data):
+    """Build TSPL job with BITMAP command for the full label."""
+    row_bytes = math.ceil(width_px / 8)
+
+    x = (LABEL_WIDTH_PX - width_px) // 2
+    y = (LABEL_HEIGHT_PX - height_px) // 2
+
+    tspl = (
+        f"SIZE {LABEL_WIDTH_MM} mm,{LABEL_HEIGHT_MM} mm\r\n"
+        f"GAP {GAP_MM} mm,0 mm\r\n"
+        f"DENSITY {DENSITY}\r\n"
+        f"SPEED {SPEED}\r\n"
+        f"CLS\r\n"
+    )
+
+    bitmap_header = f"BITMAP {x},{y},{row_bytes},{height_px},0,"
+
+    result = tspl.encode('ascii')
+    result += bitmap_header.encode('ascii')
+    result += bitmap_data
+    result += b"\r\nPRINT 1\r\n"
+
+    return result
 
 
 def extract_text_from_pdf(data):
@@ -142,31 +229,49 @@ def disconnect_existing(mac_addr):
 def prepare_data(data):
     """Convert raw input data to TSPL commands."""
     if is_tspl(data):
-        if b'BITMAP' in data[:500]:
-            log.warning("Received TSPL with BITMAP (unsupported), ignoring bitmap data")
-            return None
         log.info("Data is already TSPL, sending as-is")
         return data
 
-    if is_postscript(data):
-        log.info(f"Detected PostScript data ({len(data)} bytes), extracting text")
-        text = extract_text_from_postscript(data)
-        if text and text.strip():
-            log.info(f"Extracted {len(text)} chars, converting to TSPL")
-            return text_to_tspl(text)
-        else:
-            log.warning("No text extracted from PostScript")
-            return None
-
+    # Try bitmap rendering for PDF
     if is_pdf(data):
-        log.info(f"Detected PDF data ({len(data)} bytes), extracting text")
+        log.info(f"Detected PDF data ({len(data)} bytes), rendering to bitmap")
+        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as f:
+            f.write(data)
+            pdf_path = f.name
+        try:
+            width, height, bitmap = render_pdf_to_bitmap(pdf_path)
+            if bitmap:
+                log.info(f"Bitmap rendered: {width}x{height}, {len(bitmap)} bytes")
+                return build_bitmap_tspl(width, height, bitmap)
+        finally:
+            os.unlink(pdf_path)
+
+        # Fallback to text extraction
+        log.warning("Bitmap rendering failed, falling back to text extraction")
         text = extract_text_from_pdf(data)
         if text and text.strip():
-            log.info(f"Extracted {len(text)} chars, converting to TSPL")
             return text_to_tspl(text)
-        else:
-            log.warning("No text extracted from PDF")
-            return None
+        return None
+
+    # Try bitmap rendering for PostScript
+    if is_postscript(data):
+        log.info(f"Detected PostScript data ({len(data)} bytes), converting to bitmap")
+        pdf_path = ps_to_pdf(data)
+        if pdf_path:
+            try:
+                width, height, bitmap = render_pdf_to_bitmap(pdf_path)
+                if bitmap:
+                    log.info(f"Bitmap rendered: {width}x{height}, {len(bitmap)} bytes")
+                    return build_bitmap_tspl(width, height, bitmap)
+            finally:
+                os.unlink(pdf_path)
+
+        # Fallback to text extraction
+        log.warning("Bitmap rendering failed, falling back to text extraction")
+        text = extract_text_from_postscript(data)
+        if text and text.strip():
+            return text_to_tspl(text)
+        return None
 
     log.info(f"Wrapping {len(data)} bytes of raw text in TSPL commands")
     return wrap_text_in_tspl(data)
