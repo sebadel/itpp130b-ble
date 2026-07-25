@@ -121,7 +121,7 @@ install_filter() {
     info "Installing CUPS TSPL filter..."
     [[ -f "$FILTER_SRC" ]] || error "Filter not found at $FILTER_SRC"
     cp "$FILTER_SRC" /usr/lib/cups/filter/ble_tspl
-    chmod 700 /usr/lib/cups/filter/ble_tspl
+    chmod 755 /usr/lib/cups/filter/ble_tspl
     chown root:root /usr/lib/cups/filter/ble_tspl
     info "Filter installed at /usr/lib/cups/filter/ble_tspl"
 }
