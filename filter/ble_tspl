@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""CUPS filter: converts PDF/PostScript/text to TSPL for BLE thermal printers."""
+
+import sys
+import os
+import subprocess
+import tempfile
+import logging
+
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(levelname)s %(message)s')
+log = logging.getLogger('ble-tspl-filter')
+
+LABEL_WIDTH_MM = 100
+LABEL_HEIGHT_MM = 150
+FONT_SIZE_SMALL = 1
+FONT_SIZE_LARGE = 2
+LINE_SPACING = 28
+MARGIN_X = 10
+START_Y = 10
+
+
+def extract_text_from_pdf(data):
+    """Extract text from PDF using pdftotext."""
+    with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as f:
+        f.write(data)
+        pdf_path = f.name
+    try:
+        result = subprocess.run(
+            ['pdftotext', '-layout', pdf_path, '-'],
+            capture_output=True, timeout=30
+        )
+        text = result.stdout.decode('utf-8', errors='replace')
+        log.info(f"pdftotext extracted {len(text)} chars from PDF")
+        return text
+    except Exception as e:
+        log.error(f"pdftotext failed: {e}")
+        return None
+    finally:
+        os.unlink(pdf_path)
+
+
+def extract_text_from_postscript(data):
+    """Extract text from PostScript using ghostscript."""
+    with tempfile.NamedTemporaryFile(suffix='.ps', delete=False) as f:
+        f.write(data)
+        ps_path = f.name
+    try:
+        result = subprocess.run(
+            ['gs', '-q', '-dNOPAUSE', '-dBATCH', '-sDEVICE=txtwrite',
+             '-sOutputFile=-', ps_path],
+            capture_output=True, timeout=30
+        )
+        text = result.stdout.decode('utf-8', errors='replace')
+        log.info(f"ghostscript extracted {len(text)} chars from PostScript")
+        return text
+    except Exception as e:
+        log.error(f"ghostscript text extraction failed: {e}")
+        return None
+    finally:
+        os.unlink(ps_path)
+
+
+def text_to_tspl(text):
+    """Convert plain text to TSPL TEXT commands."""
+    lines = text.strip().split('\n')
+
+    tspl = f"SIZE {LABEL_WIDTH_MM},{LABEL_HEIGHT_MM}\n"
+    tspl += "GAP 3,0\n"
+    tspl += "DENSITY 8\n"
+    tspl += "SPEED 4\n"
+    tspl += "CLS\n"
+
+    y = START_Y
+    for line in lines:
+        if y > LABEL_HEIGHT_MM * 3.7 - 20:
+            break
+        if line.strip():
+            escaped = line.replace('"', '\\"')
+            max_chars = 28
+            while escaped:
+                chunk = escaped[:max_chars]
+                escaped = escaped[max_chars:]
+                tspl += f'TEXT {MARGIN_X},{y},"FONT 0",0,1,1,"{chunk}"\n'
+                y += LINE_SPACING
+        else:
+            y += LINE_SPACING // 2
+
+    tspl += "PRINT 1\n"
+    return tspl.encode('latin-1')
+
+
+def is_postscript(data):
+    """Check if data starts with PostScript magic bytes."""
+    return data[:2] == b'%!'
+
+
+def is_pdf(data):
+    """Check if data starts with PDF magic bytes."""
+    return data[:5] == b'%PDF-'
+
+
+def main():
+    log.info(f"Filter called with {len(sys.argv)} args")
+
+    # CUPS filter args: job-id user title copies options [file]
+    if len(sys.argv) < 6:
+        log.error(f"Not enough args: {len(sys.argv)}")
+        sys.exit(1)
+
+    # Read input data
+    if len(sys.argv) >= 7 and sys.argv[6] and sys.argv[6] != "-":
+        filepath = sys.argv[6]
+        log.info(f"Reading from file: {filepath}")
+        with open(filepath, 'rb') as f:
+            data = f.read()
+    else:
+        log.info("Reading from stdin")
+        data = sys.stdin.buffer.read()
+
+    log.info(f"Read {len(data)} bytes")
+
+    if len(data) == 0:
+        log.warning("No data to print")
+        sys.exit(0)
+
+    # Convert to text based on input format
+    text = None
+    if is_pdf(data):
+        log.info(f"Detected PDF data ({len(data)} bytes), extracting text")
+        text = extract_text_from_pdf(data)
+    elif is_postscript(data):
+        log.info(f"Detected PostScript data ({len(data)} bytes), extracting text")
+        text = extract_text_from_postscript(data)
+    else:
+        log.info(f"Treating input as plain text ({len(data)} bytes)")
+        text = data.decode('utf-8', errors='replace')
+
+    if not text or not text.strip():
+        log.error("No text extracted from input")
+        print("ERROR: Could not extract text from input", file=sys.stderr)
+        sys.exit(1)
+
+    # Convert to TSPL and output
+    tspl = text_to_tspl(text)
+    log.info(f"Generated {len(tspl)} bytes of TSPL data")
+    sys.stdout.buffer.write(tspl)
+    sys.stdout.buffer.flush()
+
+
+if __name__ == '__main__':
+    main()

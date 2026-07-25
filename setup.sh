@@ -13,6 +13,7 @@ PRINTER_NAME="Printer_ITPP130"
 PRINTER_MODEL="MUNBYN ITPP130B"
 BLE_MAC_PATTERN="DC:0D:30:4C"
 BACKEND_SRC="$SCRIPT_DIR/backend/ble"
+FILTER_SRC="$SCRIPT_DIR/filter/ble_tspl"
 PPD_SRC="$SCRIPT_DIR/ppd/Printer_ITPP130.ppd"
 
 # ---------------------------------------------------------------------------
@@ -44,7 +45,7 @@ detect_user() {
 # ---------------------------------------------------------------------------
 install_packages() {
     info "Installing required packages..."
-    pacman -S --needed --noconfirm python-bleak bluez bluez-utils bluez-cups cups poppler
+    pacman -S --needed --noconfirm python-bleak bluez bluez-utils bluez-cups cups poppler ghostscript
 }
 
 # ---------------------------------------------------------------------------
@@ -114,6 +115,18 @@ install_backend() {
 }
 
 # ---------------------------------------------------------------------------
+# 4b. Install CUPS filter
+# ---------------------------------------------------------------------------
+install_filter() {
+    info "Installing CUPS TSPL filter..."
+    [[ -f "$FILTER_SRC" ]] || error "Filter not found at $FILTER_SRC"
+    cp "$FILTER_SRC" /usr/lib/cups/filter/ble_tspl
+    chmod 700 /usr/lib/cups/filter/ble_tspl
+    chown root:root /usr/lib/cups/filter/ble_tspl
+    info "Filter installed at /usr/lib/cups/filter/ble_tspl"
+}
+
+# ---------------------------------------------------------------------------
 # 5. Install PPD
 # ---------------------------------------------------------------------------
 install_ppd() {
@@ -139,7 +152,6 @@ configure_cups() {
         -P /etc/cups/ppd/Printer_ITPP130.ppd \
         -v "$uri" \
         -o printer-is-shared=false \
-        -o raw \
         -E
 
     cupsenable "$PRINTER_NAME" 2>/dev/null || true
@@ -187,6 +199,7 @@ main() {
     ensure_bluetooth
     pair_printer
     install_backend
+    install_filter
     install_ppd
     configure_cups
     setup_sudoers

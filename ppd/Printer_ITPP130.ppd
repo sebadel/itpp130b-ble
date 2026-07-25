@@ -30,7 +30,9 @@
 *TTRasterizer: Type42
 *cupsVersion: 1.2
 *cupsManualCopies: True
-*% No cupsFilter - backend handles all data conversion
+*cupsFilter: "application/pdf 0 ble_tspl"
+*cupsFilter: "application/postscript 0 ble_tspl"
+*cupsFilter: "text/plain 0 ble_tspl"
 *cupsLanguages: "en zh_CN zh_TW"
 
 

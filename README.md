@@ -24,6 +24,7 @@ The MUNBYN ITPP130B only supports BLE (not classic Bluetooth SPP) on Linux. The 
 - CUPS printing system
 - BlueZ Bluetooth stack
 - poppler (for pdftotext PDF text extraction)
+- ghostscript (for PostScript text extraction from file viewers)
 
 ## Files
 
@@ -48,8 +49,9 @@ The CUPS backend (`/usr/lib/cups/backend/ble`) uses Python bleak to:
 
 Data flow:
 ```
-PDF input  -> pdftotext -> TSPL TEXT commands -> BLE backend -> printer
-Text input -> TSPL TEXT commands             -> BLE backend -> printer
+PDF input      -> pdftotext -> TSPL TEXT commands -> BLE backend -> printer
+PostScript     -> ghostscript txtwrite -> TSPL TEXT commands -> BLE backend -> printer
+Text input     -> TSPL TEXT commands             -> BLE backend -> printer
 ```
 
 The backend detects input type (PDF vs text vs TSPL) and converts accordingly.

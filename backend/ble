@@ -87,6 +87,32 @@ def wrap_text_in_tspl(raw_data):
     return text_to_tspl(text)
 
 
+def extract_text_from_postscript(data):
+    """Extract text from PostScript using ghostscript."""
+    with tempfile.NamedTemporaryFile(suffix='.ps', delete=False) as f:
+        f.write(data)
+        ps_path = f.name
+    try:
+        result = subprocess.run(
+            ['gs', '-q', '-dNOPAUSE', '-dBATCH', '-sDEVICE=txtwrite',
+             '-sOutputFile=-', ps_path],
+            capture_output=True, timeout=30
+        )
+        text = result.stdout.decode('utf-8', errors='replace')
+        log.info(f"ghostscript extracted {len(text)} chars from PostScript")
+        return text
+    except Exception as e:
+        log.error(f"ghostscript text extraction failed: {e}")
+        return None
+    finally:
+        os.unlink(ps_path)
+
+
+def is_postscript(data):
+    """Check if data starts with PostScript magic bytes."""
+    return data[:2] == b'%!'
+
+
 def is_pdf(data):
     """Check if data starts with PDF magic bytes."""
     return data[:5] == b'%PDF-'
@@ -121,6 +147,16 @@ def prepare_data(data):
             return None
         log.info("Data is already TSPL, sending as-is")
         return data
+
+    if is_postscript(data):
+        log.info(f"Detected PostScript data ({len(data)} bytes), extracting text")
+        text = extract_text_from_postscript(data)
+        if text and text.strip():
+            log.info(f"Extracted {len(text)} chars, converting to TSPL")
+            return text_to_tspl(text)
+        else:
+            log.warning("No text extracted from PostScript")
+            return None
 
     if is_pdf(data):
         log.info(f"Detected PDF data ({len(data)} bytes), extracting text")
