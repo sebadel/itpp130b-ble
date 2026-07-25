@@ -30,7 +30,7 @@
 *TTRasterizer: Type42
 *cupsVersion: 1.2
 *cupsManualCopies: True
-*cupsFilter: "application/vnd.cups-raster 0 rastertolabeltspl"
+*% No cupsFilter - backend handles all data conversion
 *cupsLanguages: "en zh_CN zh_TW"
 
 

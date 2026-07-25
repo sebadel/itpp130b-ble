@@ -44,7 +44,7 @@ detect_user() {
 # ---------------------------------------------------------------------------
 install_packages() {
     info "Installing required packages..."
-    pacman -S --needed --noconfirm python-bleak bluez bluez-utils bluez-cups cups
+    pacman -S --needed --noconfirm python-bleak bluez bluez-utils bluez-cups cups poppler
 }
 
 # ---------------------------------------------------------------------------
@@ -108,7 +108,7 @@ install_backend() {
     info "Installing CUPS BLE backend..."
     [[ -f "$BACKEND_SRC" ]] || error "Backend not found at $BACKEND_SRC"
     cp "$BACKEND_SRC" /usr/lib/cups/backend/ble
-    chmod 755 /usr/lib/cups/backend/ble
+    chmod 700 /usr/lib/cups/backend/ble
     chown root:root /usr/lib/cups/backend/ble
     info "Backend installed at /usr/lib/cups/backend/ble"
 }
@@ -138,8 +138,8 @@ configure_cups() {
     lpadmin -p "$PRINTER_NAME" \
         -P /etc/cups/ppd/Printer_ITPP130.ppd \
         -v "$uri" \
-        -m "MUNBYN ITPP129B" \
         -o printer-is-shared=false \
+        -o raw \
         -E
 
     cupsenable "$PRINTER_NAME" 2>/dev/null || true

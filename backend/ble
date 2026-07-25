@@ -4,13 +4,20 @@
 import sys
 import os
 import asyncio
+import subprocess
+import tempfile
 import logging
 
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger('ble-backend')
 
-LABEL_WIDTH_MM = 150
-LABEL_HEIGHT_MM = 100
+LABEL_WIDTH_MM = 100
+LABEL_HEIGHT_MM = 150
+FONT_SIZE_SMALL = 1
+FONT_SIZE_LARGE = 2
+LINE_SPACING = 28
+MARGIN_X = 10
+START_Y = 10
 
 BLE_WRITE_CHARS = [
     "0000fff2-0000-1000-8000-00805f9b34fb",
@@ -25,8 +32,28 @@ EXCLUDE_CHARS = [
 ]
 
 
-def wrap_in_tspl(raw_data):
-    text = raw_data.decode('latin-1', errors='replace')
+def extract_text_from_pdf(data):
+    """Extract text from PDF using pdftotext."""
+    with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as f:
+        f.write(data)
+        pdf_path = f.name
+    try:
+        result = subprocess.run(
+            ['pdftotext', '-layout', pdf_path, '-'],
+            capture_output=True, timeout=30
+        )
+        text = result.stdout.decode('utf-8', errors='replace')
+        log.info(f"pdftotext extracted {len(text)} chars from PDF")
+        return text
+    except Exception as e:
+        log.error(f"pdftotext failed: {e}")
+        return None
+    finally:
+        os.unlink(pdf_path)
+
+
+def text_to_tspl(text):
+    """Convert plain text to TSPL TEXT commands."""
     lines = text.strip().split('\n')
 
     tspl = f"SIZE {LABEL_WIDTH_MM},{LABEL_HEIGHT_MM}\n"
@@ -35,35 +62,98 @@ def wrap_in_tspl(raw_data):
     tspl += "SPEED 4\n"
     tspl += "CLS\n"
 
-    y = 50
+    y = START_Y
     for line in lines:
+        if y > LABEL_HEIGHT_MM * 3.7 - 20:
+            break
         if line.strip():
             escaped = line.replace('"', '\\"')
-            tspl += f'TEXT 50,{y},"FONT 0",0,1,1,"{escaped}"\n'
-            y += 30
+            max_chars = 28
+            while escaped:
+                chunk = escaped[:max_chars]
+                escaped = escaped[max_chars:]
+                tspl += f'TEXT {MARGIN_X},{y},"FONT 0",0,1,1,"{chunk}"\n'
+                y += LINE_SPACING
+        else:
+            y += LINE_SPACING // 2
 
     tspl += "PRINT 1\n"
     return tspl.encode('latin-1')
 
 
-async def ble_send(mac_addr, data):
-    from bleak import BleakClient, BleakScanner
+def wrap_text_in_tspl(raw_data):
+    """Wrap raw text data in TSPL TEXT commands."""
+    text = raw_data.decode('latin-1', errors='replace')
+    return text_to_tspl(text)
 
+
+def is_pdf(data):
+    """Check if data starts with PDF magic bytes."""
+    return data[:5] == b'%PDF-'
+
+
+def is_tspl(data):
+    """Check if data is already TSPL commands."""
     try:
         header = data[:20].decode('ascii', errors='replace').upper()
     except Exception:
-        header = ""
+        return False
+    return any(kw in header for kw in ["SIZE", "CLS", "TEXT ", "PRINT", "BARCODE", "GRAPHIC"])
 
-    is_tspl = any(kw in header for kw in ["SIZE", "CLS", "TEXT ", "PRINT", "GRAPHIC", "BARCODE"])
 
-    if is_tspl:
+def disconnect_existing(mac_addr):
+    """Disconnect device from bluetoothctl so bleak can connect."""
+    try:
+        subprocess.run(
+            ['bluetoothctl', 'disconnect', mac_addr],
+            capture_output=True, timeout=5
+        )
+        log.info(f"Disconnected {mac_addr} from bluetoothctl")
+    except Exception as e:
+        log.warning(f"bluetoothctl disconnect failed: {e}")
+
+
+def prepare_data(data):
+    """Convert raw input data to TSPL commands."""
+    if is_tspl(data):
+        if b'BITMAP' in data[:500]:
+            log.warning("Received TSPL with BITMAP (unsupported), ignoring bitmap data")
+            return None
         log.info("Data is already TSPL, sending as-is")
-        send_data = data
-    else:
-        log.info(f"Wrapping {len(data)} bytes of raw text in TSPL commands")
-        send_data = wrap_in_tspl(data)
+        return data
 
-    log.info(f"Scanning for {mac_addr}...")
+    if is_pdf(data):
+        log.info(f"Detected PDF data ({len(data)} bytes), extracting text")
+        text = extract_text_from_pdf(data)
+        if text and text.strip():
+            log.info(f"Extracted {len(text)} chars, converting to TSPL")
+            return text_to_tspl(text)
+        else:
+            log.warning("No text extracted from PDF")
+            return None
+
+    log.info(f"Wrapping {len(data)} bytes of raw text in TSPL commands")
+    return wrap_text_in_tspl(data)
+
+
+async def ble_send(mac_addr, send_data):
+    from bleak import BleakClient, BleakScanner
+
+    preview = send_data[:200].decode('latin-1', errors='replace')
+    log.info(f"TSPL header: {repr(preview[:200])}")
+
+    disconnect_existing(mac_addr)
+    await asyncio.sleep(1)
+
+    log.info(f"Connecting to {mac_addr}...")
+    try:
+        async with BleakClient(mac_addr, timeout=15) as client:
+            log.info(f"Connected directly, MTU={client.mtu_size}")
+            await _send_to_printer(client, send_data)
+            return
+    except Exception as e:
+        log.warning(f"Direct connect failed: {e}, trying scan...")
+
     device = await BleakScanner.find_device_by_address(mac_addr, timeout=15)
     if not device:
         device = await BleakScanner.find_device_by_name("ITPP130B", timeout=10)
@@ -74,57 +164,64 @@ async def ble_send(mac_addr, data):
 
     log.info(f"Found: {device.name} [{device.address}]")
     async with BleakClient(device) as client:
-        log.info(f"Connected, MTU={client.mtu_size}")
+        log.info(f"Connected via scan, MTU={client.mtu_size}")
+        await _send_to_printer(client, send_data)
 
-        write_char = None
-        uuid_lower = [c.lower() for c in BLE_WRITE_CHARS]
-        excl_lower = [c.lower() for c in EXCLUDE_CHARS]
 
+async def _send_to_printer(client, send_data):
+    write_char = None
+    uuid_lower = [c.lower() for c in BLE_WRITE_CHARS]
+    excl_lower = [c.lower() for c in EXCLUDE_CHARS]
+
+    for service in client.services:
+        for char in service.characteristics:
+            char_uuid_str = str(char.uuid).lower()
+            if char_uuid_str in uuid_lower:
+                write_char = char.uuid
+                log.info(f"Using preferred characteristic: {char.uuid}")
+                break
+        if write_char:
+            break
+
+    if not write_char:
         for service in client.services:
             for char in service.characteristics:
                 char_uuid_str = str(char.uuid).lower()
-                if char_uuid_str in uuid_lower:
-                    write_char = char.uuid
-                    log.info(f"Using preferred characteristic: {char.uuid}")
-                    break
+                if 'write-without-response' in char.properties or 'write' in char.properties:
+                    if char_uuid_str not in excl_lower:
+                        write_char = char.uuid
+                        log.info(f"Using fallback characteristic: {char.uuid} ({char.properties})")
+                        break
             if write_char:
                 break
 
-        if not write_char:
-            for service in client.services:
-                for char in service.characteristics:
-                    char_uuid_str = str(char.uuid).lower()
-                    if 'write-without-response' in char.properties or 'write' in char.properties:
-                        if char_uuid_str not in excl_lower:
-                            write_char = char.uuid
-                            log.info(f"Using fallback characteristic: {char.uuid} ({char.properties})")
-                            break
-                if write_char:
-                    break
+    if not write_char:
+        log.error("No suitable write characteristic found")
+        print("ERROR: No writable BLE characteristic found", file=sys.stderr)
+        sys.exit(1)
 
-        if not write_char:
-            log.error("No suitable write characteristic found")
-            print("ERROR: No writable BLE characteristic found", file=sys.stderr)
-            sys.exit(1)
+    import time
+    log.info(f"Sending {len(send_data)} bytes of TSPL data via BLE (MTU={client.mtu_size})")
+    t_start = time.monotonic()
+    mtu = client.mtu_size - 3
+    offset = 0
+    total = len(send_data)
+    chunks = 0
+    while offset < total:
+        chunk = send_data[offset:offset + mtu]
+        try:
+            await client.write_gatt_char(write_char, chunk, response=False)
+        except Exception as e:
+            log.warning(f"Write error at {offset}: {e}, retrying")
+            await asyncio.sleep(0.1)
+            await client.write_gatt_char(write_char, chunk, response=False)
+        offset += len(chunk)
+        chunks += 1
 
-        log.info(f"Sending {len(send_data)} bytes of TSPL data")
-        mtu = client.mtu_size - 3
-        offset = 0
-        total = len(send_data)
-        while offset < total:
-            chunk = send_data[offset:offset + mtu]
-            try:
-                await client.write_gatt_char(write_char, chunk, response=False)
-            except Exception as e:
-                log.warning(f"Write error at {offset}: {e}, retrying")
-                await asyncio.sleep(0.1)
-                await client.write_gatt_char(write_char, chunk, response=False)
-            offset += len(chunk)
-            if offset < total:
-                await asyncio.sleep(0.02)
-
-        log.info(f"Sent {total} bytes")
-        await asyncio.sleep(1)
+    t_sent = time.monotonic()
+    elapsed = t_sent - t_start
+    log.info(f"Sent {total} bytes in {chunks} chunks in {elapsed:.1f}s ({total/max(elapsed,0.001):.0f} bytes/s)")
+    await asyncio.sleep(1)
 
 
 def main():
@@ -157,7 +254,7 @@ def main():
 
     log.info(f"Print job for {mac}")
 
-    if len(sys.argv) >= 7 and sys.argv[6] != "-":
+    if len(sys.argv) >= 7 and sys.argv[6] and sys.argv[6] != "-":
         filepath = sys.argv[6]
         log.info(f"Reading from file: {filepath}")
         with open(filepath, 'rb') as f:
@@ -172,7 +269,13 @@ def main():
         log.warning("No data to print")
         sys.exit(0)
 
-    asyncio.run(ble_send(mac, data))
+    send_data = prepare_data(data)
+    if not send_data:
+        log.error("Failed to prepare print data")
+        print("ERROR: Could not convert input to printable format", file=sys.stderr)
+        sys.exit(1)
+
+    asyncio.run(ble_send(mac, send_data))
     log.info("Done")
 
 
