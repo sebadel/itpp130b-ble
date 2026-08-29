@@ -5,6 +5,9 @@ thermal label printer over Bluetooth Low Energy on Linux.
 
 ![MUNBYN ITPP130B thermal label printer](assets/itpp130b.jpg)
 
+- [Manufacturer page](https://pos.munbyn.com/munbyn-itpp130-series-thermal-label-printer/)
+- [Buy on Amazon](https://www.amazon.com.be/dp/B0CLLYQ2WH?th=1)
+
 ## Features
 
 - Direct BLE GATT printing through a CUPS backend
