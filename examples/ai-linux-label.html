@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Linux BLE Printer Demo</title>
+  <style>
+    @page { size: 150mm 100mm; margin: 0; }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; width: 150mm; height: 100mm; }
+    body {
+      background: #fff;
+      color: #111;
+      font-family: Arial, Helvetica, sans-serif;
+      padding: 8mm;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+    }
+    .eyebrow {
+      font-size: 10pt;
+      font-weight: 700;
+      letter-spacing: 2pt;
+      text-transform: uppercase;
+    }
+    h1 {
+      font-size: 31pt;
+      line-height: .96;
+      margin: 5mm 0 3mm;
+      max-width: 125mm;
+    }
+    .accent { color: #1746d1; }
+    .message {
+      font-size: 15pt;
+      line-height: 1.12;
+      max-width: 122mm;
+    }
+    footer {
+      border-top: 1.5pt solid #111;
+      padding-top: 3mm;
+      display: flex;
+      justify-content: space-between;
+      align-items: end;
+      font-size: 9pt;
+      font-weight: 700;
+      letter-spacing: .6pt;
+    }
+    .stack { text-align: right; line-height: 1.35; }
+  </style>
+</head>
+<body>
+  <div>
+    <div class="eyebrow">A small act of refusal</div>
+    <h1>No Linux driver?<br><span class="accent">Write one.</span></h1>
+    <div class="message">
+      In the era of AI, a manufacturer being too lazy to support Linux is no
+      longer a good reason to stop printing.
+    </div>
+  </div>
+  <footer>
+    <div>OPEN SOURCE / LINUX / BLE</div>
+    <div class="stack">OpenCode + Omarchy<br>MUNBYN ITPP130B + CUPS</div>
+  </footer>
+</body>
+</html>

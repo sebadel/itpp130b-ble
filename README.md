@@ -92,6 +92,9 @@ python -m unittest discover -v
 
 Hardware testing requires a powered-on printer and a working BLE adapter.
 
+The [`examples/`](examples/) directory contains a printable demo label used
+for hardware and video testing.
+
 ## Limitations
 
 - The driver is currently tuned for the ITPP130B and TSPL-compatible devices.
