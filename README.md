@@ -3,6 +3,8 @@
 An open-source CUPS backend and filter for printing to the MUNBYN ITPP130B
 thermal label printer over Bluetooth Low Energy on Linux.
 
+![MUNBYN ITPP130B thermal label printer](assets/itpp130b.jpg)
+
 ## Features
 
 - Direct BLE GATT printing through a CUPS backend
@@ -52,9 +54,10 @@ The configured default is 100 x 150 mm media at 203 dpi. For labels mounted
 side-by-side on the roll and entering the printer short-edge-first, select
 **Landscape** in the application print dialog.
 
-Large bitmap jobs can take 40 seconds or more over BLE. CUPS may report the
-job as complete when the BLE writes finish; the printer does not provide a
-reliable print-completion acknowledgement.
+BLE printing can take up to 30 seconds, depending on the job size. The printer
+LED is **green while busy** and **blue when ready**. CUPS may report the job as
+complete when the BLE writes finish; the printer does not provide a reliable
+print-completion acknowledgement.
 
 ## Architecture
 
