@@ -9,7 +9,7 @@ import tempfile
 import math
 import logging
 
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(levelname)s %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger('ble-backend')
 
 LABEL_WIDTH_MM = 100
@@ -18,6 +18,7 @@ DPI = 203
 GAP_MM = 3
 DENSITY = 8
 SPEED = 4
+BLE_CHUNK_DELAY = 0.005
 
 LABEL_WIDTH_PX = int(round(LABEL_WIDTH_MM / 25.4 * DPI))
 LABEL_HEIGHT_PX = int(round(LABEL_HEIGHT_MM / 25.4 * DPI))
@@ -35,7 +36,7 @@ EXCLUDE_CHARS = [
 ]
 
 
-def render_pdf_to_bitmap(pdf_path):
+def render_pdf_to_bitmap(pdf_path, landscape=False):
     """Render PDF to monochrome PBM using pdftoppm at printer DPI."""
     with tempfile.NamedTemporaryFile(suffix='.pbm', delete=False) as f:
         prefix = f.name[:-4]
@@ -44,8 +45,8 @@ def render_pdf_to_bitmap(pdf_path):
         subprocess.run([
             'pdftoppm', '-mono', '-singlefile',
             '-r', str(DPI),
-            '-scale-to-x', str(LABEL_WIDTH_PX),
-            '-scale-to-y', str(LABEL_HEIGHT_PX),
+            '-scale-to-x', str(LABEL_HEIGHT_PX if landscape else LABEL_WIDTH_PX),
+            '-scale-to-y', str(LABEL_WIDTH_PX if landscape else LABEL_HEIGHT_PX),
             pdf_path, prefix
         ], check=True, timeout=30)
 
@@ -58,8 +59,13 @@ def render_pdf_to_bitmap(pdf_path):
         width, height = map(int, dims.strip().split())
         log.info(f"pdftoppm rendered {width}x{height} PBM ({len(data)} bytes)")
 
-        # PBM P4: 1=black, 0=white
-        # Many printers use 1=black (intuitive), no inversion needed
+        row_bytes = math.ceil(width / 8)
+        data = bytes(value ^ 0xFF for value in data)
+        if width % 8:
+            mask = (0xFF << (8 - width % 8)) & 0xFF
+            data = b''.join(data[offset:offset + row_bytes - 1] +
+                            bytes([data[offset + row_bytes - 1] & mask])
+                            for offset in range(0, len(data), row_bytes))
         return width, height, data
     except Exception as e:
         log.error(f"pdftoppm failed: {e}")
@@ -94,29 +100,46 @@ def ps_to_pdf(ps_data):
             pass
 
 
-def build_bitmap_tspl(width_px, height_px, bitmap_data):
-    """Build TSPL job with BITMAP command for the full label."""
+MAX_STRIP_ROWS = 100
+
+
+def build_bitmap_tspl(width_px, height_px, bitmap_data, landscape=False):
+    """Build TSPL as a list of chunks: header, then one chunk per BITMAP strip, then PRINT."""
     row_bytes = math.ceil(width_px / 8)
+    total_rows = height_px
 
-    x = (LABEL_WIDTH_PX - width_px) // 2
-    y = (LABEL_HEIGHT_PX - height_px) // 2
+    canvas_width_px = LABEL_HEIGHT_PX if landscape else LABEL_WIDTH_PX
+    canvas_height_px = LABEL_WIDTH_PX if landscape else LABEL_HEIGHT_PX
+    canvas_width_mm = LABEL_HEIGHT_MM if landscape else LABEL_WIDTH_MM
+    canvas_height_mm = LABEL_WIDTH_MM if landscape else LABEL_HEIGHT_MM
+    x = (canvas_width_px - width_px) // 2
+    y_start = (canvas_height_px - height_px) // 2
 
-    tspl = (
-        f"SIZE {LABEL_WIDTH_MM} mm,{LABEL_HEIGHT_MM} mm\r\n"
+    header = (
+        f"SIZE {canvas_width_mm} mm,{canvas_height_mm} mm\r\n"
         f"GAP {GAP_MM} mm,0 mm\r\n"
         f"DENSITY {DENSITY}\r\n"
         f"SPEED {SPEED}\r\n"
         f"CLS\r\n"
-    )
+    ).encode('ascii')
 
-    bitmap_header = f"BITMAP {x},{y},{row_bytes},{height_px},0,"
+    chunks = [header]
 
-    result = tspl.encode('ascii')
-    result += bitmap_header.encode('ascii')
-    result += bitmap_data
-    result += b"\r\nPRINT 1\r\n"
+    rows_sent = 0
+    while rows_sent < total_rows:
+        rows_this_strip = min(MAX_STRIP_ROWS, total_rows - rows_sent)
+        offset = rows_sent * row_bytes
+        strip_data = bitmap_data[offset:offset + rows_this_strip * row_bytes]
 
-    return result
+        y = y_start + rows_sent
+        mode = 0 if rows_sent == 0 else 1
+        cmd = f"BITMAP {x},{y},{row_bytes},{rows_this_strip},{mode},".encode('ascii')
+        chunks.append(cmd + strip_data + b"\r\n")
+
+        rows_sent += rows_this_strip
+
+    chunks.append(b"PRINT 1\r\n")
+    return chunks
 
 
 def extract_text_from_pdf(data):
@@ -149,7 +172,7 @@ def text_to_tspl(text):
     tspl += "SPEED 4\n"
     tspl += "CLS\n"
 
-    y = START_Y
+    y = 10
     for line in lines:
         if y > LABEL_HEIGHT_MM * 3.7 - 20:
             break
@@ -159,10 +182,10 @@ def text_to_tspl(text):
             while escaped:
                 chunk = escaped[:max_chars]
                 escaped = escaped[max_chars:]
-                tspl += f'TEXT {MARGIN_X},{y},"FONT 0",0,1,1,"{chunk}"\n'
-                y += LINE_SPACING
+                tspl += f'TEXT 10,{y},"FONT 0",0,1,1,"{chunk}"\n'
+                y += 28
         else:
-            y += LINE_SPACING // 2
+            y += 14
 
     tspl += "PRINT 1\n"
     return tspl.encode('latin-1')
@@ -226,7 +249,7 @@ def disconnect_existing(mac_addr):
         log.warning(f"bluetoothctl disconnect failed: {e}")
 
 
-def prepare_data(data):
+def prepare_data(data, landscape=False):
     """Convert raw input data to TSPL commands."""
     if is_tspl(data):
         log.info("Data is already TSPL, sending as-is")
@@ -239,10 +262,10 @@ def prepare_data(data):
             f.write(data)
             pdf_path = f.name
         try:
-            width, height, bitmap = render_pdf_to_bitmap(pdf_path)
+            width, height, bitmap = render_pdf_to_bitmap(pdf_path, landscape=landscape)
             if bitmap:
                 log.info(f"Bitmap rendered: {width}x{height}, {len(bitmap)} bytes")
-                return build_bitmap_tspl(width, height, bitmap)
+                return build_bitmap_tspl(width, height, bitmap, landscape=landscape)
         finally:
             os.unlink(pdf_path)
 
@@ -259,10 +282,10 @@ def prepare_data(data):
         pdf_path = ps_to_pdf(data)
         if pdf_path:
             try:
-                width, height, bitmap = render_pdf_to_bitmap(pdf_path)
+                width, height, bitmap = render_pdf_to_bitmap(pdf_path, landscape=landscape)
                 if bitmap:
                     log.info(f"Bitmap rendered: {width}x{height}, {len(bitmap)} bytes")
-                    return build_bitmap_tspl(width, height, bitmap)
+                    return build_bitmap_tspl(width, height, bitmap, landscape=landscape)
             finally:
                 os.unlink(pdf_path)
 
@@ -280,8 +303,14 @@ def prepare_data(data):
 async def ble_send(mac_addr, send_data):
     from bleak import BleakClient, BleakScanner
 
-    preview = send_data[:200].decode('latin-1', errors='replace')
-    log.info(f"TSPL header: {repr(preview[:200])}")
+    if isinstance(send_data, list):
+        total = sum(len(c) for c in send_data)
+        preview = send_data[0][:200].decode('latin-1', errors='replace')
+        log.info(f"TSPL chunks: {len(send_data)} chunks, {total} bytes total")
+        log.info(f"First chunk preview: {repr(preview[:200])}")
+    else:
+        preview = send_data[:200].decode('latin-1', errors='replace')
+        log.info(f"TSPL header: {repr(preview[:200])}")
 
     disconnect_existing(mac_addr)
     await asyncio.sleep(1)
@@ -297,7 +326,10 @@ async def ble_send(mac_addr, send_data):
 
     device = await BleakScanner.find_device_by_address(mac_addr, timeout=15)
     if not device:
-        device = await BleakScanner.find_device_by_name("ITPP130B", timeout=10)
+        device = await BleakScanner.find_device_by_filter(
+            lambda d, ad: (d.name or ad.local_name or '').upper().startswith('ITPP130B'),
+            timeout=10,
+        )
     if not device:
         log.error(f"Device {mac_addr} not found")
         print(f"ERROR: Device {mac_addr} not found via BLE scan", file=sys.stderr)
@@ -314,12 +346,15 @@ async def _send_to_printer(client, send_data):
     uuid_lower = [c.lower() for c in BLE_WRITE_CHARS]
     excl_lower = [c.lower() for c in EXCLUDE_CHARS]
 
-    for service in client.services:
-        for char in service.characteristics:
-            char_uuid_str = str(char.uuid).lower()
-            if char_uuid_str in uuid_lower:
-                write_char = char.uuid
-                log.info(f"Using preferred characteristic: {char.uuid}")
+    # Search in preference order, not BlueZ service order.
+    for preferred_uuid in uuid_lower:
+        for service in client.services:
+            for char in service.characteristics:
+                if str(char.uuid).lower() == preferred_uuid:
+                    write_char = char.uuid
+                    log.info(f"Using preferred characteristic: {char.uuid}")
+                    break
+            if write_char:
                 break
         if write_char:
             break
@@ -342,26 +377,52 @@ async def _send_to_printer(client, send_data):
         sys.exit(1)
 
     import time
-    log.info(f"Sending {len(send_data)} bytes of TSPL data via BLE (MTU={client.mtu_size})")
-    t_start = time.monotonic()
     mtu = client.mtu_size - 3
-    offset = 0
-    total = len(send_data)
-    chunks = 0
-    while offset < total:
-        chunk = send_data[offset:offset + mtu]
-        try:
-            await client.write_gatt_char(write_char, chunk, response=False)
-        except Exception as e:
-            log.warning(f"Write error at {offset}: {e}, retrying")
-            await asyncio.sleep(0.1)
-            await client.write_gatt_char(write_char, chunk, response=False)
-        offset += len(chunk)
-        chunks += 1
 
-    t_sent = time.monotonic()
-    elapsed = t_sent - t_start
-    log.info(f"Sent {total} bytes in {chunks} chunks in {elapsed:.1f}s ({total/max(elapsed,0.001):.0f} bytes/s)")
+    if isinstance(send_data, list):
+        total = sum(len(c) for c in send_data)
+        log.info(f"Sending {total} bytes in {len(send_data)} strips via BLE (MTU={client.mtu_size})")
+        t_start = time.monotonic()
+        all_chunks = 0
+        for i, strip in enumerate(send_data):
+            offset = 0
+            while offset < len(strip):
+                chunk = strip[offset:offset + mtu]
+                try:
+                    await client.write_gatt_char(write_char, chunk, response=False)
+                except Exception as e:
+                    log.warning(f"Write error at strip {i} offset {offset}: {e}, retrying")
+                    await asyncio.sleep(0.1)
+                    await client.write_gatt_char(write_char, chunk, response=False)
+                offset += len(chunk)
+                all_chunks += 1
+                await asyncio.sleep(BLE_CHUNK_DELAY)
+            if i < len(send_data) - 1 and i > 0:
+                await asyncio.sleep(0.1)
+        t_sent = time.monotonic()
+        elapsed = t_sent - t_start
+        log.info(f"Sent {total} bytes in {all_chunks} chunks in {elapsed:.1f}s ({total/max(elapsed,0.001):.0f} bytes/s)")
+    else:
+        log.info(f"Sending {len(send_data)} bytes of TSPL data via BLE (MTU={client.mtu_size})")
+        t_start = time.monotonic()
+        offset = 0
+        total = len(send_data)
+        chunks = 0
+        while offset < total:
+            chunk = send_data[offset:offset + mtu]
+            try:
+                await client.write_gatt_char(write_char, chunk, response=False)
+            except Exception as e:
+                log.warning(f"Write error at {offset}: {e}, retrying")
+                await asyncio.sleep(0.1)
+                await client.write_gatt_char(write_char, chunk, response=False)
+            offset += len(chunk)
+            chunks += 1
+            await asyncio.sleep(BLE_CHUNK_DELAY)
+        t_sent = time.monotonic()
+        elapsed = t_sent - t_start
+        log.info(f"Sent {total} bytes in {chunks} chunks in {elapsed:.1f}s ({total/max(elapsed,0.001):.0f} bytes/s)")
+
     await asyncio.sleep(1)
 
 
@@ -410,7 +471,9 @@ def main():
         log.warning("No data to print")
         sys.exit(0)
 
-    send_data = prepare_data(data)
+    options = sys.argv[5].lower()
+    landscape = 'landscape' in options or 'orientation=landscape' in options
+    send_data = prepare_data(data, landscape=landscape)
     if not send_data:
         log.error("Failed to prepare print data")
         print("ERROR: Could not convert input to printable format", file=sys.stderr)

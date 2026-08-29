@@ -1,83 +1,101 @@
-# ITPP130B BLE Printer Driver
+# MUNBYN ITPP130B BLE CUPS Driver
 
-CUPS driver for MUNBYN ITPP130B shipping label printer over Bluetooth Low Energy (BLE) on Arch Linux.
+An open-source CUPS backend and filter for printing to the MUNBYN ITPP130B
+thermal label printer over Bluetooth Low Energy on Linux.
 
-## Quick Start
+## Features
 
-```bash
-sudo ./setup.sh
-```
-
-## What It Does
-
-The MUNBYN ITPP130B only supports BLE (not classic Bluetooth SPP) on Linux. The manufacturer's Windows-only BLE driver doesn't work on Linux. This driver:
-
-1. Installs a custom CUPS backend that communicates via BLE GATT
-2. Installs a CUPS filter that converts PDF/PostScript/text to TSPL
-3. Pairs the printer via Bluetooth
-4. Enables printing from any application (file viewers, command line, etc.)
+- Direct BLE GATT printing through a CUPS backend
+- PDF and PostScript rasterization at 203 dpi
+- Plain-text to TSPL conversion
+- Multi-page PDF support
+- Landscape and portrait orientation handling
+- Chunk pacing for the printer's BLE receive buffer
 
 ## Requirements
 
-- Arch Linux (or derivative)
-- Python 3.10+ with bleak (`python-bleak`)
-- CUPS printing system
-- BlueZ Bluetooth stack
-- poppler (for pdftotext PDF text extraction)
-- ghostscript (for PostScript text extraction from file viewers)
+- Arch Linux or another system with CUPS and BlueZ
+- Python 3.10 or newer
+- `bleak`
+- `cups`, `bluez`, and `bluez-utils`
+- `poppler` for PDF rasterization
+- `ghostscript` for PostScript conversion
 
-## Files
+The installer currently uses `pacman`, so Arch Linux or a compatible
+distribution is required for the automated setup.
 
-- `setup.sh` - Automated installer
-- `backend/ble` - CUPS backend (Python 3 + bleak)
-- `filter/ble_tspl` - CUPS filter (converts PDF/PS/text to TSPL)
-- `ppd/Printer_ITPP130.ppd` - PPD with cupsFilter entries
-- `README.md` - Documentation
+## Install
 
-## Known Issues
+Power on the printer, load the labels, and close the cover. Then run:
 
-- **PDF images not supported**: Only text content from PDFs is printed (the printer doesn't support BLE bitmap rendering)
-- **Extra blank label**: Each print may produce one extra blank label (firmware behavior)
-- **BLE reconnection**: After system sleep, power-cycle the printer to re-enable BLE
-
-## How It Works
-
-### CUPS Filter (`/usr/lib/cups/filter/ble_tspl`)
-
-The filter handles format conversion:
-- Detects input type (PDF, PostScript, or plain text)
-- Extracts text using pdftotext (PDF) or ghostscript (PostScript)
-- Converts text to TSPL TEXT commands
-- Outputs TSPL for the backend
-
-### CUPS Backend (`/usr/lib/cups/backend/ble`)
-
-The backend handles BLE communication:
-1. Disconnects any existing bluetoothctl connection
-2. Connects directly via BLE GATT
-3. Finds a writable characteristic (prefers FFF2 or ISSC UART)
-4. Sends TSPL data in MTU-sized chunks
-
-### Data Flow
-
-```
-Application (Evince, lp, etc.)
-    |
-    v
-CUPS Filter (ble_tspl)
-    |-- PDF: pdftotext -> TSPL TEXT commands
-    |-- PostScript: ghostscript -> TSPL TEXT commands
-    |-- Text: wrap in TSPL TEXT commands
-    |
-    v
-CUPS Backend (ble)
-    |
-    v
-Printer (BLE GATT)
+```bash
+sudo env TARGET_USER="$USER" ./setup.sh
 ```
 
-This architecture allows file viewers to print correctly since they send `application/pdf` which CUPS routes through the filter.
+The installer scans for the BLE advertisement, installs the backend, filter,
+and PPD, and creates the CUPS printer `Printer_ITPP130`.
+
+If the printer is not found, make sure it is ready and advertising. A power
+cycle may be required after system sleep.
+
+## Print
+
+The printer should appear in desktop print dialogs as `Printer_ITPP130`.
+For a terminal test:
+
+```bash
+printf 'Hello from CUPS\n' | lp -d Printer_ITPP130
+lp -d Printer_ITPP130 document.pdf
+```
+
+The configured default is 100 x 150 mm media at 203 dpi. For labels mounted
+side-by-side on the roll and entering the printer short-edge-first, select
+**Landscape** in the application print dialog.
+
+Large bitmap jobs can take 40 seconds or more over BLE. CUPS may report the
+job as complete when the BLE writes finish; the printer does not provide a
+reliable print-completion acknowledgement.
+
+## Architecture
+
+```text
+Application
+    |
+    v
+CUPS filter: PDF/PostScript/text -> TSPL
+    |
+    v
+CUPS backend: TSPL -> BLE GATT characteristic
+    |
+    v
+ITPP130B printer
+```
+
+The verified data characteristic is:
+
+```text
+0000fff2-0000-1000-8000-00805f9b34fb
+```
+
+The backend also recognizes the ISSC UART write characteristic as a fallback.
+
+## Development
+
+Run the tests without requiring a printer:
+
+```bash
+python -m unittest discover -v
+```
+
+Hardware testing requires a powered-on printer and a working BLE adapter.
+
+## Limitations
+
+- The driver is currently tuned for the ITPP130B and TSPL-compatible devices.
+- BLE discovery can be intermittent; power-cycling the printer usually restores
+  advertising.
+- Firmware may advance one extra blank label after some jobs.
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).

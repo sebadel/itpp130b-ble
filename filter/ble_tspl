@@ -6,9 +6,10 @@ import os
 import subprocess
 import tempfile
 import math
+import glob
 import logging
 
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(levelname)s %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger('ble-tspl-filter')
 
 LABEL_WIDTH_MM = 100
@@ -22,41 +23,83 @@ LABEL_WIDTH_PX = int(round(LABEL_WIDTH_MM / 25.4 * DPI))
 LABEL_HEIGHT_PX = int(round(LABEL_HEIGHT_MM / 25.4 * DPI))
 
 
-def render_pdf_to_bitmap(pdf_path):
-    """Render PDF to monochrome PBM using pdftoppm at printer DPI."""
-    with tempfile.NamedTemporaryFile(suffix='.pbm', delete=False) as f:
-        prefix = f.name[:-4]
+def _read_pbm(path):
+    with open(path, 'rb') as f:
+        magic = f.readline().strip()
+        if magic != b'P4':
+            raise ValueError(f'unsupported PBM format: {magic!r}')
 
-    try:
+        line = f.readline()
+        while line.startswith(b'#'):
+            line = f.readline()
+        width, height = map(int, line.split())
+        return width, height, f.read()
+
+
+def _invert_pbm(width, height, data):
+    """Invert PBM pixels for the printer's BITMAP polarity."""
+    row_bytes = math.ceil(width / 8)
+    padding = row_bytes * 8 - width
+    last_mask = 0xFF if not padding else (0xFF << padding) & 0xFF
+    result = bytearray()
+    for offset in range(0, len(data), row_bytes):
+        row = bytearray(value ^ 0xFF for value in data[offset:offset + row_bytes])
+        if row:
+            row[-1] &= last_mask
+        result.extend(row)
+    return bytes(result)
+
+
+def _rotate_pbm_90(width, height, data):
+    """Rotate packed PBM pixels clockwise by 90 degrees."""
+    source_row_bytes = math.ceil(width / 8)
+    rotated_width = height
+    rotated_height = width
+    rotated_row_bytes = math.ceil(rotated_width / 8)
+    result = bytearray(rotated_row_bytes * rotated_height)
+    for y in range(height):
+        for x in range(width):
+            source_bit = (data[y * source_row_bytes + x // 8] >> (7 - x % 8)) & 1
+            if source_bit:
+                new_x = height - 1 - y
+                new_y = x
+                result[new_y * rotated_row_bytes + new_x // 8] |= 1 << (7 - new_x % 8)
+    return rotated_width, rotated_height, bytes(result)
+
+
+def render_pdf_to_bitmaps(pdf_path, landscape=False, rotate=False):
+    """Render every PDF page to a monochrome PBM at printer resolution."""
+    with tempfile.TemporaryDirectory() as directory:
+        prefix = os.path.join(directory, 'page')
+
+        render_landscape = landscape and not rotate
+        width_px = LABEL_HEIGHT_PX if render_landscape else LABEL_WIDTH_PX
+        height_px = LABEL_WIDTH_PX if render_landscape else LABEL_HEIGHT_PX
         subprocess.run([
-            'pdftoppm', '-mono', '-singlefile',
+            'pdftoppm', '-mono',
             '-r', str(DPI),
-            '-scale-to-x', str(LABEL_WIDTH_PX),
-            '-scale-to-y', str(LABEL_HEIGHT_PX),
+            '-scale-to-x', str(width_px),
+            '-scale-to-y', str(height_px),
             pdf_path, prefix
         ], check=True, timeout=30)
 
-        pbm_path = prefix + '.pbm'
-        with open(pbm_path, 'rb') as f:
-            header = f.readline()  # P4
-            dims = f.readline()    # WIDTH HEIGHT
-            data = f.read()
+        pages = []
+        page_paths = sorted(
+            glob.glob(prefix + '-*.pbm'),
+            key=lambda path: int(path.rsplit('-', 1)[1].split('.', 1)[0]),
+        )
+        for pbm_path in page_paths:
+            width, height, data = _read_pbm(pbm_path)
+            data = _invert_pbm(width, height, data)
+            if rotate:
+                width, height, data = _rotate_pbm_90(width, height, data)
+            pages.append((width, height, data))
+        if not pages:
+            raise ValueError('pdftoppm produced no pages')
 
-        width, height = map(int, dims.strip().split())
-        log.info(f"pdftoppm rendered {width}x{height} PBM ({len(data)} bytes)")
-
-        # PBM P4: 1=black, 0=white
-        # Many printers use 1=black (intuitive), no inversion needed
-        return width, height, data
-    except Exception as e:
-        log.error(f"pdftoppm failed: {e}")
-        return None, None, None
-    finally:
-        for ext in ['.pbm']:
-            try:
-                os.unlink(prefix + ext)
-            except OSError:
-                pass
+        for width, height, data in pages:
+            log.info(f"pdftoppm rendered {width}x{height} PBM ({len(data)} bytes)")
+        return pages
 
 
 def ps_to_pdf(ps_data):
@@ -82,29 +125,57 @@ def ps_to_pdf(ps_data):
             pass
 
 
-def build_bitmap_tspl(width_px, height_px, bitmap_data):
-    """Build TSPL job with BITMAP command for the full label."""
+def pdf_is_landscape(pdf_path):
+    """Use the source page orientation when CUPS did not provide one."""
+    try:
+        result = subprocess.run(['pdfinfo', pdf_path], capture_output=True,
+                                text=True, check=True, timeout=10)
+        for line in result.stdout.splitlines():
+            if line.startswith('Page size:'):
+                width, height = (float(value) for value in line.split()[2:4])
+                return width > height
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass
+    return False
+
+
+MAX_STRIP_ROWS = 100
+
+
+def build_bitmap_tspl(width_px, height_px, bitmap_data, landscape=False):
+    """Build one TSPL label from PBM data (PBM 1=black, matching TSPL)."""
     row_bytes = math.ceil(width_px / 8)
+    total_rows = height_px
 
-    # Center image on label
-    x = (LABEL_WIDTH_PX - width_px) // 2
-    y = (LABEL_HEIGHT_PX - height_px) // 2
+    canvas_width_px = LABEL_HEIGHT_PX if landscape else LABEL_WIDTH_PX
+    canvas_height_px = LABEL_WIDTH_PX if landscape else LABEL_HEIGHT_PX
+    canvas_width_mm = LABEL_HEIGHT_MM if landscape else LABEL_WIDTH_MM
+    canvas_height_mm = LABEL_WIDTH_MM if landscape else LABEL_HEIGHT_MM
+    x = (canvas_width_px - width_px) // 2
+    y_start = (canvas_height_px - height_px) // 2
 
-    tspl = (
-        f"SIZE {LABEL_WIDTH_MM} mm,{LABEL_HEIGHT_MM} mm\r\n"
+    result = (
+        f"SIZE {canvas_width_mm} mm,{canvas_height_mm} mm\r\n"
         f"GAP {GAP_MM} mm,0 mm\r\n"
         f"DENSITY {DENSITY}\r\n"
         f"SPEED {SPEED}\r\n"
         f"CLS\r\n"
-    )
+    ).encode('ascii')
 
-    bitmap_header = f"BITMAP {x},{y},{row_bytes},{height_px},0,"
+    rows_sent = 0
+    while rows_sent < total_rows:
+        rows_this_strip = min(MAX_STRIP_ROWS, total_rows - rows_sent)
+        offset = rows_sent * row_bytes
+        strip_data = bitmap_data[offset:offset + rows_this_strip * row_bytes]
 
-    result = tspl.encode('ascii')
-    result += bitmap_header.encode('ascii')
-    result += bitmap_data
-    result += b"\r\nPRINT 1\r\n"
+        y = y_start + rows_sent
+        result += f"BITMAP {x},{y},{row_bytes},{rows_this_strip},0,".encode('ascii')
+        result += strip_data
+        result += b"\r\n"
 
+        rows_sent += rows_this_strip
+
+    result += b"PRINT 1\r\n"
     return result
 
 
@@ -152,6 +223,9 @@ def main():
         log.error(f"Not enough args: {len(sys.argv)}")
         sys.exit(1)
 
+    options = sys.argv[5].split()
+    landscape = 'landscape' in options or 'orientation-requested=4' in options
+
     if len(sys.argv) >= 7 and sys.argv[6] and sys.argv[6] != "-":
         filepath = sys.argv[6]
         log.info(f"Reading from file: {filepath}")
@@ -169,23 +243,30 @@ def main():
 
     # Try bitmap rendering for PDF/PostScript
     pdf_path = None
+    pages = []
     try:
-        if is_pdf(data):
-            log.info(f"Detected PDF ({len(data)} bytes), rendering to bitmap")
-            with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as f:
-                f.write(data)
-                pdf_path = f.name
-            width, height, bitmap = render_pdf_to_bitmap(pdf_path)
+        try:
+            if is_pdf(data):
+                log.info(f"Detected PDF ({len(data)} bytes), rendering to bitmap")
+                with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as f:
+                    f.write(data)
+                    pdf_path = f.name
+                source_landscape = pdf_is_landscape(pdf_path)
+                rotate = landscape and not source_landscape
+                landscape = landscape or source_landscape
+                pages = render_pdf_to_bitmaps(pdf_path, landscape=landscape, rotate=rotate)
+            elif is_postscript(data):
+                log.info(f"Detected PostScript ({len(data)} bytes), converting to PDF then bitmap")
+                pdf_path = ps_to_pdf(data)
+                if pdf_path:
+                    source_landscape = pdf_is_landscape(pdf_path)
+                    rotate = landscape and not source_landscape
+                    landscape = landscape or source_landscape
+                    pages = render_pdf_to_bitmaps(pdf_path, landscape=landscape, rotate=rotate)
+        except (OSError, subprocess.SubprocessError, ValueError) as exc:
+            log.warning(f"Bitmap rendering failed: {exc}")
 
-        elif is_postscript(data):
-            log.info(f"Detected PostScript ({len(data)} bytes), converting to PDF then bitmap")
-            pdf_path = ps_to_pdf(data)
-            if pdf_path:
-                width, height, bitmap = render_pdf_to_bitmap(pdf_path)
-            else:
-                width, height, bitmap = None, None, None
-
-        else:
+        if not is_pdf(data) and not is_postscript(data):
             log.info(f"Plain text input ({len(data)} bytes), using TEXT commands")
             text = data.decode('utf-8', errors='replace')
             tspl = text_to_tspl(text)
@@ -194,10 +275,10 @@ def main():
             sys.stdout.buffer.flush()
             return
 
-        if bitmap and width and height:
-            log.info(f"Bitmap rendered: {width}x{height}, {len(bitmap)} bytes")
-            tspl = build_bitmap_tspl(width, height, bitmap)
-            log.info(f"Generated {len(tspl)} bytes of TSPL BITMAP data")
+        if pages:
+            tspl = b''.join(build_bitmap_tspl(width, height, bitmap, landscape=landscape)
+                            for width, height, bitmap in pages)
+            log.info(f"Rendered {len(pages)} page(s), generated {len(tspl)} bytes of TSPL BITMAP data")
             sys.stdout.buffer.write(tspl)
             sys.stdout.buffer.flush()
         else:

@@ -10,11 +10,23 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PRINTER_NAME="Printer_ITPP130"
-PRINTER_MODEL="MUNBYN ITPP130B"
-BLE_MAC_PATTERN="DC:0D:30:4C"
 BACKEND_SRC="$SCRIPT_DIR/backend/ble"
 FILTER_SRC="$SCRIPT_DIR/filter/ble_tspl"
 PPD_SRC="$SCRIPT_DIR/ppd/Printer_ITPP130.ppd"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --user)
+            [[ $# -ge 2 ]] || { printf 'error: --user requires a username\n' >&2; exit 1; }
+            TARGET_USER="$2"
+            shift 2
+            ;;
+        *)
+            printf 'error: unknown option: %s\n' "$1" >&2
+            exit 1
+            ;;
+    esac
+done
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -72,7 +84,12 @@ pair_printer() {
         kill "$SCAN_PID" 2>/dev/null || true
         wait "$SCAN_PID" 2>/dev/null || true
 
-        BLE_MAC=$(bluetoothctl devices | grep -i "ITPP130B" | grep -oE "([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}" | head -1)
+        # Prefer the LE advertisement. The same printer also exposes a
+        # classic-Bluetooth entry, which bleak cannot use for GATT printing.
+        BLE_MAC=$(bluetoothctl devices | awk 'tolower($0) ~ /itpp130b/ && tolower($0) ~ /-le([[:space:]]|$)/ {print $2; exit}')
+        if [[ -z "$BLE_MAC" ]]; then
+            BLE_MAC=$(bluetoothctl devices | awk 'tolower($0) ~ /itpp130b/ {print $2; exit}')
+        fi
         if [[ -n "$BLE_MAC" ]]; then
             break
         fi
@@ -90,7 +107,7 @@ pair_printer() {
 
     info "Found printer at $BLE_MAC"
 
-    # Pair via bluetoothctl (classic BT for discovery; BLE is used for data)
+    # Pair/trust the discovered BLE device so BlueZ permits GATT access.
     info "Pairing printer..."
     bluetoothctl -- pair "$BLE_MAC" 2>/dev/null || true
     sleep 1
@@ -151,6 +168,7 @@ configure_cups() {
     lpadmin -p "$PRINTER_NAME" \
         -P /etc/cups/ppd/Printer_ITPP130.ppd \
         -v "$uri" \
+        -o raw=false \
         -o printer-is-shared=false \
         -E
 
