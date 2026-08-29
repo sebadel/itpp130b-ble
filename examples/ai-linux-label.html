@@ -22,6 +22,17 @@
       letter-spacing: 2pt;
       text-transform: uppercase;
     }
+    .logos {
+      display: flex;
+      gap: 7mm;
+      align-items: center;
+      font-size: 12pt;
+      font-weight: 800;
+      letter-spacing: .8pt;
+    }
+    .logo-openwatt { color: #111; }
+    .logo-omarchy { color: #e45b27; }
+    .logo-opencode { color: #1746d1; }
     h1 {
       font-size: 31pt;
       line-height: .96;
@@ -29,36 +40,31 @@
       max-width: 125mm;
     }
     .accent { color: #1746d1; }
-    .message {
-      font-size: 15pt;
-      line-height: 1.12;
-      max-width: 122mm;
-    }
     footer {
       border-top: 1.5pt solid #111;
       padding-top: 3mm;
       display: flex;
       justify-content: space-between;
       align-items: end;
-      font-size: 9pt;
+      font-size: 8pt;
       font-weight: 700;
       letter-spacing: .6pt;
     }
-    .stack { text-align: right; line-height: 1.35; }
+    .link { font-family: monospace; letter-spacing: 0; }
   </style>
 </head>
 <body>
   <div>
-    <div class="eyebrow">A small act of refusal</div>
-    <h1>No Linux driver?<br><span class="accent">Write one.</span></h1>
-    <div class="message">
-      In the era of AI, a manufacturer being too lazy to support Linux is no
-      longer a good reason to stop printing.
+    <div class="logos">
+      <span class="logo-openwatt">OPENWATT</span>
+      <span class="logo-omarchy">OMARCHY</span>
+      <span class="logo-opencode">OPENCODE</span>
     </div>
+    <h1>No Linux driver,<br><span class="accent">have an agent write it for you</span></h1>
   </div>
   <footer>
-    <div>OPEN SOURCE / LINUX / BLE</div>
-    <div class="stack">OpenCode + Omarchy<br>MUNBYN ITPP130B + CUPS</div>
+    <div>$2 on OpenCode Go<br>and 1 hour later</div>
+    <div class="link">github.com/sebadel/itpp130b-ble</div>
   </footer>
 </body>
 </html>
