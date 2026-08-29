@@ -26,13 +26,11 @@
       display: flex;
       gap: 7mm;
       align-items: center;
-      font-size: 12pt;
-      font-weight: 800;
-      letter-spacing: .8pt;
     }
-    .logo-openwatt { color: #111; }
-    .logo-omarchy { color: #e45b27; }
-    .logo-opencode { color: #1746d1; }
+    .logos img { display: block; object-fit: contain; }
+    .logo-openwatt { width: 42mm; height: 10mm; }
+    .logo-omarchy { width: 12mm; height: 12mm; }
+    .logo-opencode { width: 30mm; height: 10mm; }
     h1 {
       font-size: 31pt;
       line-height: .96;
@@ -56,9 +54,9 @@
 <body>
   <div>
     <div class="logos">
-      <span class="logo-openwatt">OPENWATT</span>
-      <span class="logo-omarchy">OMARCHY</span>
-      <span class="logo-opencode">OPENCODE</span>
+      <img class="logo-openwatt" src="./logos/openwatt.png" alt="OpenWatt">
+      <img class="logo-omarchy" src="./logos/omarchy.png" alt="Omarchy">
+      <img class="logo-opencode" src="./logos/opencode.png" alt="OpenCode">
     </div>
     <h1>No Linux driver,<br><span class="accent">have an agent write it for you</span></h1>
   </div>
